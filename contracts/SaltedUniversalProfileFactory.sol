@@ -5,6 +5,7 @@ pragma solidity ^0.8.22;
 import {LSP2Utils} from "@lukso/lsp-smart-contracts/contracts/LSP2ERC725YJSONSchema/LSP2Utils.sol";
 
 // constants
+import "./constants.sol";
 import  {
     _LSP1_UNIVERSAL_RECEIVER_DELEGATE_KEY
 } from "@lukso/lsp-smart-contracts/contracts/LSP1UniversalReceiver/LSP1Constants.sol";
@@ -21,6 +22,7 @@ import {
 } from "@lukso/lsp-smart-contracts/contracts/LSP6KeyManager/LSP6Constants.sol";
 
 // modules
+import {LSP0ERC725Account} from "@lukso/lsp-smart-contracts/contracts/LSP0ERC725Account/LSP0ERC725Account.sol";
 import {ILSP23LinkedContractsFactory} from "@lukso/lsp-smart-contracts/contracts/LSP23LinkedContractsFactory/ILSP23LinkedContractsFactory.sol";
 import {LSP23LinkedContractsFactory} from "@lukso/lsp-smart-contracts/contracts/LSP23LinkedContractsFactory/LSP23LinkedContractsFactory.sol";
 import {UniversalProfileInit} from "@lukso/lsp-smart-contracts/contracts/UniversalProfileInit.sol";
@@ -29,6 +31,7 @@ import {LSP6KeyManagerInit} from "@lukso/lsp-smart-contracts/contracts/LSP6KeyMa
 
 // errors
 error CallerNotUniversalProfileOwner(address caller, address universalProfile);
+error ValueSentIsLessThanPrice(uint256 valueSent, uint256 price);
 
 // events
 event SaltedUniversalProfileDeployed(
@@ -40,32 +43,23 @@ event SaltedUniversalProfileExported(
 	address indexed universalProfileAddress
 );
 
-contract SaltedUniversalProfileFactory {
-	/// ------ Constants - DO NOT CHANGE ------
-    address constant LSP23_ADDRESS = 0x2300000A84D25dF63081feAa37ba6b62C4c89a30;
-    address constant POST_DEPLOYMENT_MODULE_ADDRESS = 0x000000000066093407b6704B89793beFfD0D8F00;
-    address constant UP_INIT_ADDRESS = 0x52c90985AF970D4E0DC26Cb5D052505278aF32A9;
-    address constant KM_INIT_ADDRESS = 0xa75684d7D048704a2DB851D05Ba0c3cbe226264C;
-    address constant URD_UP_ADDRESS  = 0xA5467dfe7019bF2C7C5F7A707711B9d4cAD118c8;
-    bytes constant URD_PERMISSIONS = hex"0000000000000000000000000000000000000000000000000000000000060080"; 
-	/// ---------------------------------------
-
+contract SaltedUniversalProfileFactory is LSP0ERC725Account {
 	/**
 	 * @dev Used to store the owner of each deployed up.
 	 */
     mapping (address => address) private universalProfilesOwners;
-	mapping (address => address[]) private deployedUniversalProfiles;
-	mapping (address => address[]) private exportedUniversalProfiles;
 
 	/**
-	 * @dev Gatekeeper, doen't allow modifying the Universal Profile unless the caller is the one that deployed it. 
+	 * @dev Vefify if the sent value is at least 1 ether, revert otherwise.
 	 */
-	modifier OnlyUniversalProfileOwner(address universalProfileAddress) {
-		if (msg.sender != universalProfilesOwners[universalProfileAddress]) {
-			revert CallerNotUniversalProfileOwner(msg.sender, universalProfileAddress);
+	modifier OnlyPricePaid() {
+		if (msg.value < 1 ether) {
+			revert ValueSentIsLessThanPrice(msg.value, 1 ether);
 		}
 		_;
 	}
+
+	constructor (address newOwner) LSP0ERC725Account(newOwner) {}
 
 	/**
 	 * @notice Deployed a 🧂 (salted) Universal Profile.
@@ -80,9 +74,14 @@ contract SaltedUniversalProfileFactory {
 	 * 
 	 * @return universalProfileAddress The address of the 🧂 (salted) Universal Profile.
 	 */
-    function deploy(bytes32 salt) public payable returns(address universalProfileAddress) {
-		address caller = msg.sender;
-
+    function deploy(
+		bytes32 salt
+	)
+		public
+		payable
+		OnlyPricePaid
+		returns(address universalProfileAddress)
+	{
 		/// ------ Data for Universal Profile deployment ------
 		ILSP23LinkedContractsFactory.PrimaryContractDeploymentInit memory primaryContractDeploymentInit = ILSP23LinkedContractsFactory.PrimaryContractDeploymentInit({
 			salt: salt,
@@ -165,10 +164,29 @@ contract SaltedUniversalProfileFactory {
 			);
 		/// -----------------------------------------------------------
 
-		universalProfilesOwners[universalProfileAddress] = caller;
-		deployedUniversalProfiles[caller].push(universalProfileAddress);
+		uint128 deployedUniversalProfilesCount = uint128(bytes16(
+			_getData(DEPLOYED_SALTED_UP_ARRAY_KEY)
+		));
+
+		_setData(
+			DEPLOYED_SALTED_UP_ARRAY_KEY,
+			abi.encodePacked(bytes16(deployedUniversalProfilesCount + 1)));
+		_setData(
+			LSP2Utils.generateArrayElementKeyAtIndex(
+				DEPLOYED_SALTED_UP_ARRAY_KEY,
+				deployedUniversalProfilesCount
+			),
+			abi.encodePacked(universalProfileAddress)
+		);
+		_setData(
+			LSP2Utils.generateMappingKey(
+				DEPLOYED_SALTED_UP_ARRAY_MAP_PREFIX,
+				bytes20(universalProfileAddress)
+			),
+			abi.encodePacked(msg.sender, false)
+		);
 		
-		emit SaltedUniversalProfileDeployed(caller, universalProfileAddress);
+		emit SaltedUniversalProfileDeployed(msg.sender, universalProfileAddress);
     }
 
 	/**
@@ -184,7 +202,18 @@ contract SaltedUniversalProfileFactory {
 		address universalProfileAddress,
 		address newMainController,
 		bytes memory LSP3ProfileMetadata
-	) public OnlyUniversalProfileOwner(universalProfileAddress) {
+	) public {
+		address unviersalProfileOwner = address(bytes20(_getData(
+			LSP2Utils.generateMappingKey(
+				DEPLOYED_SALTED_UP_ARRAY_MAP_PREFIX,
+				bytes20(universalProfileAddress)
+			)
+		)));
+
+		if (msg.sender != unviersalProfileOwner) {
+			revert CallerNotUniversalProfileOwner(msg.sender, universalProfileAddress);
+		}
+
 		/// ------ Encode Data Keys & Values for updating permissions & LSP3Metadata ------
 		bytes32[] memory dataKeys = new bytes32[](4);
 		// ------ LSP3 ------
@@ -223,26 +252,25 @@ contract SaltedUniversalProfileFactory {
 
 		UniversalProfile(payable(universalProfileAddress)).setDataBatch(dataKeys, dataValues);
 
-		exportedUniversalProfiles[msg.sender].push(universalProfileAddress);
+		_setData(
+			LSP2Utils.generateMappingKey(
+				DEPLOYED_SALTED_UP_ARRAY_MAP_PREFIX,
+				bytes20(universalProfileAddress)
+			),
+			abi.encodePacked(unviersalProfileOwner, true)
+		);
+
 		emit SaltedUniversalProfileExported(msg.sender, universalProfileAddress);
 	}
 
-	function getUniversalProfilesOwner(
-		address universalProfileAddress
-	) public view returns(address owner) {
-		return universalProfilesOwners[universalProfileAddress];
-	}
+	function setData(bytes32 dataKey, bytes memory dataValue) public payable override {
+		if (bytes16(dataKey) == bytes16(DEPLOYED_SALTED_UP_ARRAY_KEY)) {
+			revert("Cannot manually edit `DeployedSaltedUniversalProfiles[]` data key");
+		}
+		if (bytes10(dataKey) == DEPLOYED_SALTED_UP_ARRAY_MAP_PREFIX) {
+			revert("Cannot manually edit `DeployedSaltedUniversalProfileMap` data key");
+		}
 
-	function getDeployedUniversalProfiles(
-		address universalProfileAddress
-	) public view returns(address[] memory owner) {
-		return deployedUniversalProfiles[universalProfileAddress];
+		super.setData(dataKey, dataValue);
 	}
-	
-	function getExportedUniversalProfiles(
-		address universalProfileAddress
-	) public view returns(address[] memory owner) {
-		return exportedUniversalProfiles[universalProfileAddress];
-	}
-
 }
